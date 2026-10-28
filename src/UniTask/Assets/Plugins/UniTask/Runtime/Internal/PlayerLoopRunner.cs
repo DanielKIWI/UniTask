@@ -126,6 +126,9 @@ namespace Cysharp.Threading.Tasks.Internal
                     LastTimeUpdate();
                     break;
 #endif
+                case PlayerLoopTiming.NextOpportunity:
+                    NextOpportunity();
+                    break;
                 default:
                     break;
             }
@@ -152,6 +155,7 @@ namespace Cysharp.Threading.Tasks.Internal
         void TimeUpdate() => RunCore();
         void LastTimeUpdate() => RunCore();
 #endif
+        void NextOpportunity() => RunCore();
 
         [System.Diagnostics.DebuggerHidden]
         void RunCore()

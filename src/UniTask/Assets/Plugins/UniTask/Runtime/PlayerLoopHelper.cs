@@ -66,6 +66,10 @@ namespace Cysharp.Threading.Tasks
         public struct UniTaskLoopRunnerYieldTimeUpdate { };
         public struct UniTaskLoopRunnerLastYieldTimeUpdate { };
 #endif
+
+        // NextOpportunity - shared single instance injected into every phase
+        public struct UniTaskLoopRunnerYieldNextOpportunity { };
+        public struct UniTaskLoopRunnerNextOpportunity { };
     }
 
     public enum PlayerLoopTiming
@@ -95,6 +99,9 @@ namespace Cysharp.Threading.Tasks
         // Unity 2020.2 added TimeUpdate https://docs.unity3d.com/2020.2/Documentation/ScriptReference/PlayerLoop.TimeUpdate.html
         TimeUpdate = 14,
         LastTimeUpdate = 15,
+        NextOpportunity = 16,
+#else
+        NextOpportunity = 14,
 #endif
     }
 
@@ -111,7 +118,8 @@ namespace Cysharp.Threading.Tasks
             PreUpdate | LastPreUpdate |
             Update | LastUpdate |
             PreLateUpdate | LastPreLateUpdate |
-            PostLateUpdate | LastPostLateUpdate
+            PostLateUpdate | LastPostLateUpdate |
+            NextOpportunity
 #if UNITY_2020_2_OR_NEWER
             | TimeUpdate | LastTimeUpdate,
 #else
@@ -128,7 +136,8 @@ namespace Cysharp.Threading.Tasks
             PreUpdate |
             Update |
             PreLateUpdate |
-            PostLateUpdate | LastPostLateUpdate
+            PostLateUpdate | LastPostLateUpdate |
+            NextOpportunity
 #if UNITY_2020_2_OR_NEWER
             | TimeUpdate
 #endif
@@ -161,14 +170,14 @@ namespace Cysharp.Threading.Tasks
         LastPreLateUpdate = 2048,
 
         PostLateUpdate = 4096,
-        LastPostLateUpdate = 8192
+        LastPostLateUpdate = 8192,
 
 #if UNITY_2020_2_OR_NEWER
-        ,
         // Unity 2020.2 added TimeUpdate https://docs.unity3d.com/2020.2/Documentation/ScriptReference/PlayerLoop.TimeUpdate.html
         TimeUpdate = 16384,
-        LastTimeUpdate = 32768
+        LastTimeUpdate = 32768,
 #endif
+        NextOpportunity = 65536
     }
 
     public interface IPlayerLoopItem
@@ -379,6 +388,40 @@ namespace Cysharp.Threading.Tasks
             throw new Exception("Target PlayerLoopSystem does not found. Type:" + systemType.FullName);
         }
 
+        // Injects the shared NextOpportunity queue/runner at the front of a single phase's subsystem list.
+        // Because one queue instance is shared across all phases, ContinuationQueue's drain-once semantics
+        // (if (actionListCount == 0) return) ensure continuations fire exactly once at whichever phase runs first.
+        static void InsertLoopNextOpportunity(PlayerLoopSystem[] copyList, InjectPlayerLoopTimings injectTimings, Type loopType, ContinuationQueue sharedQueue, PlayerLoopRunner sharedRunner)
+        {
+            var i = FindLoopSystemIndex(copyList, loopType);
+            if ((injectTimings & InjectPlayerLoopTimings.NextOpportunity) == InjectPlayerLoopTimings.NextOpportunity)
+            {
+                var source = RemoveRunner(copyList[i],
+                    typeof(UniTaskLoopRunners.UniTaskLoopRunnerYieldNextOpportunity),
+                    typeof(UniTaskLoopRunners.UniTaskLoopRunnerNextOpportunity));
+
+                var dest = new PlayerLoopSystem[source.Length + 2];
+                dest[0] = new PlayerLoopSystem
+                {
+                    type = typeof(UniTaskLoopRunners.UniTaskLoopRunnerYieldNextOpportunity),
+                    updateDelegate = sharedQueue.Run
+                };
+                dest[1] = new PlayerLoopSystem
+                {
+                    type = typeof(UniTaskLoopRunners.UniTaskLoopRunnerNextOpportunity),
+                    updateDelegate = sharedRunner.Run
+                };
+                Array.Copy(source, 0, dest, 2, source.Length);
+                copyList[i].subSystemList = dest;
+            }
+            else
+            {
+                copyList[i].subSystemList = RemoveRunner(copyList[i],
+                    typeof(UniTaskLoopRunners.UniTaskLoopRunnerYieldNextOpportunity),
+                    typeof(UniTaskLoopRunners.UniTaskLoopRunnerNextOpportunity));
+            }
+        }
+
         static void InsertLoop(PlayerLoopSystem[] copyList, InjectPlayerLoopTimings injectTimings, Type loopType, InjectPlayerLoopTimings targetTimings,
             int index, bool injectOnFirst, Type loopRunnerYieldType, Type loopRunnerType, PlayerLoopTiming playerLoopTiming)
         {
@@ -398,11 +441,11 @@ namespace Cysharp.Threading.Tasks
         public static void Initialize(ref PlayerLoopSystem playerLoop, InjectPlayerLoopTimings injectTimings = InjectPlayerLoopTimings.All)
         {
 #if UNITY_2020_2_OR_NEWER
-            yielders = new ContinuationQueue[16];
-            runners = new PlayerLoopRunner[16];
+            yielders = new ContinuationQueue[17];
+            runners = new PlayerLoopRunner[17];
 #else
-            yielders = new ContinuationQueue[14];
-            runners = new PlayerLoopRunner[14];
+            yielders = new ContinuationQueue[15];
+            runners = new PlayerLoopRunner[15];
 #endif
 
             var copyList = playerLoop.subSystemList.ToArray();
@@ -480,6 +523,46 @@ namespace Cysharp.Threading.Tasks
                 InjectPlayerLoopTimings.LastTimeUpdate, 15, false,
                 typeof(UniTaskLoopRunners.UniTaskLoopRunnerLastYieldTimeUpdate), typeof(UniTaskLoopRunners.UniTaskLoopRunnerLastTimeUpdate), PlayerLoopTiming.LastTimeUpdate);
 #endif
+
+            // NextOpportunity: one shared queue+runner registered at the front of every phase.
+            // The first phase to fire each cycle drains the queue; all subsequent phases see it empty and skip.
+            {
+                var nextOpportunityIndex = (int)PlayerLoopTiming.NextOpportunity;
+                ContinuationQueue nextOppQueue = null;
+                PlayerLoopRunner nextOppRunner = null;
+
+                if ((injectTimings & InjectPlayerLoopTimings.NextOpportunity) == InjectPlayerLoopTimings.NextOpportunity)
+                {
+                    nextOppQueue = yielders[nextOpportunityIndex] = new ContinuationQueue(PlayerLoopTiming.NextOpportunity);
+                    nextOppRunner = runners[nextOpportunityIndex] = new PlayerLoopRunner(PlayerLoopTiming.NextOpportunity);
+
+#if UNITY_EDITOR
+                    EditorApplication.playModeStateChanged += (state) =>
+                    {
+                        if (state == PlayModeStateChange.EnteredEditMode || state == PlayModeStateChange.ExitingEditMode)
+                        {
+                            IsEditorApplicationQuitting = true;
+                            nextOppRunner.Run();
+                            nextOppRunner.Clear();
+                            nextOppQueue.Run();
+                            nextOppQueue.Clear();
+                            IsEditorApplicationQuitting = false;
+                        }
+                    };
+#endif
+                }
+
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.Initialization), nextOppQueue, nextOppRunner);
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.EarlyUpdate), nextOppQueue, nextOppRunner);
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.FixedUpdate), nextOppQueue, nextOppRunner);
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.PreUpdate), nextOppQueue, nextOppRunner);
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.Update), nextOppQueue, nextOppRunner);
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.PreLateUpdate), nextOppQueue, nextOppRunner);
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.PostLateUpdate), nextOppQueue, nextOppRunner);
+#if UNITY_2020_2_OR_NEWER
+                InsertLoopNextOpportunity(copyList, injectTimings, typeof(PlayerLoopType.TimeUpdate), nextOppQueue, nextOppRunner);
+#endif
+            }
 
             // Insert UniTaskSynchronizationContext to Update loop
             var i = FindLoopSystemIndex(copyList, typeof(PlayerLoopType.Update));
